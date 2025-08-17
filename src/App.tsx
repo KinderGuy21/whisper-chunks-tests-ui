@@ -1,19 +1,26 @@
 import React, { useEffect, useRef, useState } from 'react';
 
+// Type definition for log items
 type LogItem = { ts: string; msg: string };
+
+/**
+ * Returns the current time formatted as a string.
+ */
 function now() {
   return new Date().toLocaleTimeString();
 }
 
+/**
+ * Main application component for the audio recorder.
+ */
 export default function App() {
-  const [backend, setBackend] = useState<string>('http://localhost:3000'); // your Nest API
+  const [backend, setBackend] = useState<string>('http://localhost:3000');
   const [sessionId, setSessionId] = useState<string>(() =>
     Math.random().toString(36).slice(2)
   );
-  const [timesliceMs, setTimesliceMs] = useState<number>(20000); // 60s
-  const [overlapMs, setOverlapMs] = useState<number>(2000); // 2s
+  const [timesliceMs, setTimesliceMs] = useState<number>(100000);
   const [mimeType, setMimeType] = useState<string>('audio/webm;codecs=opus');
-
+  const [isPaused, setIsPaused] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const [seq, setSeq] = useState(0);
   const [chunksSent, setChunksSent] = useState<number>(0);
@@ -24,35 +31,114 @@ export default function App() {
   const [organizationId, setOrganizationId] = useState<string>('');
   const [appointmentId, setAppointmentId] = useState<string>('');
 
+  // Refs to hold mutable data without causing re-renders
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const lastTailRef = useRef<Blob | null>(null);
+  const audioStreamRef = useRef<MediaStream | null>(null);
   const startMsRef = useRef<number>(0);
   const runningRef = useRef<boolean>(false);
 
+  /**
+   * Pushes a new message to the log state.
+   * @param msg The message to log.
+   */
   function pushLog(msg: string) {
     setLog((l) => [{ ts: now(), msg }, ...l].slice(0, 500));
   }
 
+  /**
+   * Checks if a given mime type is supported by the browser.
+   * @param mt The mime type string.
+   * @returns A boolean indicating support.
+   */
   function supportsMimeType(mt: string) {
-    // Safari 17+ supports audio/webm;codecs=opus partially. If unsupported, let browser pick default.
     return (
       typeof MediaRecorder !== 'undefined' &&
       (MediaRecorder.isTypeSupported?.(mt) ?? true)
     );
   }
 
-  async function startRecording() {
+  /**
+   * Starts a new MediaRecorder instance and sets up its ondataavailable handler.
+   * This function is the core of the recording loop.
+   */
+  async function startNewRecorder() {
+    if (!audioStreamRef.current || !runningRef.current) {
+      pushLog('Stopping recorder loop.');
+      return;
+    }
+
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const mt = supportsMimeType(mimeType) ? mimeType : undefined;
+      // 1. Create the new recorder instance
       const mr = new MediaRecorder(
-        stream,
+        audioStreamRef.current,
         mt ? ({ mimeType: mt } as MediaRecorderOptions) : undefined
       );
 
+      // 2. The ondataavailable handler will process the current chunk
+      //    and then recursively call startNewRecorder to continue the chain.
+      mr.ondataavailable = async (evt: BlobEvent) => {
+        // Detach the handler to prevent any possibility of it being called again.
+        mr.ondataavailable = null;
+
+        if (!runningRef.current) return;
+
+        const chunk = evt.data;
+        if (chunk && chunk.size > 0) {
+          const currentSeq = seqRef();
+          const startMs = startMsRef.current;
+          const endMs = startMs + timesliceMs;
+
+          try {
+            await uploadBlob(chunk, currentSeq, startMs, endMs);
+            setChunksSent((c) => c + 1);
+            pushLog(`Uploaded seq=${currentSeq} bytes=${chunk.size}`);
+          } catch (e: any) {
+            setErrors((x) => x + 1);
+            pushLog('Upload error: ' + (e?.message || e));
+          }
+
+          // Advance sequence and timeline for the *next* recorder
+          startMsRef.current = endMs;
+          setSeq((s) => s + 1);
+        }
+
+        // 3. Immediately start the next recorder to ensure seamless recording.
+        //    This call creates the next link in the chain.
+        if (runningRef.current) {
+          startNewRecorder();
+        }
+      };
+
+      // Stop the *previous* recorder, if one exists and is active.
+      // This is what triggers the ondataavailable for the previous chunk,
+      // which will then upload its data.
+      if (
+        mediaRecorderRef.current &&
+        mediaRecorderRef.current.state === 'recording'
+      ) {
+        mediaRecorderRef.current.stop();
+      }
+
+      // 4. Update the ref to point to our new recorder and start it.
       mediaRecorderRef.current = mr;
-      lastTailRef.current = null;
-      startMsRef.current = 0;
+      mr.start(timesliceMs);
+      pushLog(`Recorder for seq=${seqRef()} started.`);
+    } catch (err: any) {
+      pushLog('Recorder creation error: ' + (err?.message || err));
+    }
+  }
+  /**
+   * Starts the initial audio recording process.
+   */
+  async function startRecording() {
+    try {
+      // Get the audio stream and store it in a ref. This stream will be reused.
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      audioStreamRef.current = stream;
+
+      // Reset state and refs
+      startMsRef.current = Date.now();
       runningRef.current = true;
       setSeq(0);
       setChunksSent(0);
@@ -60,63 +146,55 @@ export default function App() {
       setIsRecording(true);
       pushLog('Recording started');
 
-      mr.ondataavailable = async (evt: BlobEvent) => {
-        if (!runningRef.current) return;
-        const chunk = evt.data;
-        if (!chunk || chunk.size === 0) return;
-
-        // Approximate tail size based on timeslice ratio - good enough for a POC.
-        let toUpload: Blob = chunk;
-
-        const currentSeq = seqRef();
-        const startMs = startMsRef.current;
-        const endMs = startMs + timesliceMs;
-
-        try {
-          await uploadBlob(toUpload, currentSeq, startMs, endMs);
-          setChunksSent((c) => c + 1);
-          pushLog(`Uploaded seq=${currentSeq} bytes=${toUpload.size}`);
-        } catch (e: any) {
-          setErrors((x) => x + 1);
-          pushLog('Upload error: ' + (e?.message || e));
-        }
-
-        // Prepare next tail from the fresh chunk
-        if (overlapMs > 0) {
-          const tailBytes = Math.max(
-            0,
-            Math.floor(chunk.size * (overlapMs / timesliceMs))
-          );
-          lastTailRef.current =
-            tailBytes > 0
-              ? chunk.slice(chunk.size - tailBytes, chunk.size)
-              : null;
-        }
-
-        // Advance seq and timeline
-        startMsRef.current = endMs;
-        setSeq((s) => s + 1);
-      };
-
-      mr.start(timesliceMs); // trigger periodic delivery
+      // Start the first recorder
+      startNewRecorder();
     } catch (err: any) {
       pushLog('Mic error: ' + (err?.message || err));
     }
   }
 
-  async function stopRecording() {
-    runningRef.current = false;
-    setIsRecording(false);
-    mediaRecorderRef.current?.stop();
-    mediaRecorderRef.current?.stream.getTracks().forEach((t) => t.stop());
-    pushLog('Recording stopped');
+  /**
+   * Toggles the pause/unpause state of the recording process.
+   * Assumes mediaRecorderRef.current and audioStreamRef.current are already set up
+   * and the recording has been started.
+   */
+  async function pauseUnpauseRecording() {
+    if (!mediaRecorderRef.current) {
+      console.warn('MediaRecorder is not initialized.');
+      return;
+    }
+
+    if (mediaRecorderRef.current.state === 'recording') {
+      // If currently recording, pause it
+      mediaRecorderRef.current.pause();
+      pushLog('Recording paused');
+      setIsPaused(true);
+      // Do NOT stop audio tracks here, as that would end the stream.
+    } else if (mediaRecorderRef.current.state === 'paused') {
+      // If currently paused, resume it
+      mediaRecorderRef.current.resume();
+      setIsPaused(false);
+      pushLog('Recording resumed');
+    } else {
+      // Handle other states like 'inactive' or 'stopped' if necessary,
+      // though typically this function would only be called when recording is active.
+      console.warn(
+        `MediaRecorder is in an unexpected state: ${mediaRecorderRef.current.state}`
+      );
+    }
   }
 
+  /**
+   * Finalizes the session on the backend.
+   */
   async function finalize() {
+    pushLog('Calling finalize endpoint...');
     try {
       const res = await fetch(`${backend}/finalize`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+        },
         body: JSON.stringify({
           sessionId,
           therapistId,
@@ -125,14 +203,60 @@ export default function App() {
           appointmentId,
         }),
       });
-      if (!res.ok) throw new Error(await res.text());
+      if (!res.ok)
+        throw new Error(
+          `Server responded with ${res.status}: ${await res.text()}`
+        );
+
       const j = await res.json();
-      pushLog('Finalize: ' + JSON.stringify(j));
+      pushLog('Finalize successful: ' + JSON.stringify(j));
     } catch (e: any) {
       pushLog('Finalize error: ' + (e?.message || e));
     }
   }
+  /**
+   * Stops the recording, ensures the final chunk is uploaded,
+   * releases the microphone, and notifies the backend.
+   */
+  async function stopAndFinalizeRecording() {
+    if (!mediaRecorderRef.current) {
+      pushLog('No recording is active to stop.');
+      return;
+    }
 
+    pushLog('Stopping and finalizing recording...');
+    setIsRecording(false);
+
+    // 1. Signal the recording loop to stop.
+    // The next ondataavailable handler will not start a new recorder.
+    runningRef.current = false;
+
+    // 2. Stop the current MediaRecorder. This will trigger one last
+    // `ondataavailable` event to process and upload the final audio chunk.
+    if (mediaRecorderRef.current.state === 'recording') {
+      mediaRecorderRef.current.stop();
+    }
+
+    // 3. Release the microphone and clean up the stream reference.
+    if (audioStreamRef.current) {
+      audioStreamRef.current.getTracks().forEach((track) => track.stop());
+      audioStreamRef.current = null;
+    }
+
+    // 4. Call the backend to finalize the session.
+    await finalize();
+
+    // Optional: Reset refs after finalization
+    mediaRecorderRef.current = null;
+  }
+
+  /**
+   * Uploads a single chunk of audio data to the backend.
+   * @param blob The Blob object to upload.
+   * @param seq The sequence number of the chunk.
+   * @param startMs The start timestamp of the chunk.
+   * @param endMs The end timestamp of the chunk.
+   */
   async function uploadBlob(
     blob: Blob,
     seq: number,
@@ -187,10 +311,7 @@ export default function App() {
             />
           </div>
         </div>
-        <div
-          className='row-3'
-          style={{ marginTop: 12 }}
-        >
+        <div className='row-3' style={{ marginTop: 12 }}>
           <div>
             <label>Therapist ID</label>
             <input
@@ -213,10 +334,7 @@ export default function App() {
             />
           </div>
         </div>
-        <div
-          className='row-3'
-          style={{ marginTop: 12 }}
-        >
+        <div className='row-3' style={{ marginTop: 12 }}>
           <div>
             <label>Appointment ID</label>
             <input
@@ -227,10 +345,7 @@ export default function App() {
           <div></div>
           <div></div>
         </div>
-        <div
-          className='row-3'
-          style={{ marginTop: 12 }}
-        >
+        <div className='row-3' style={{ marginTop: 12 }}>
           <div>
             <label>Timeslice (ms)</label>
             <input
@@ -239,16 +354,6 @@ export default function App() {
               min={1000}
               step={500}
               onChange={(e) => setTimesliceMs(Number(e.target.value))}
-            />
-          </div>
-          <div>
-            <label>Overlap (ms)</label>
-            <input
-              type='number'
-              value={overlapMs}
-              min={0}
-              step={100}
-              onChange={(e) => setOverlapMs(Number(e.target.value))}
             />
           </div>
           <div>
@@ -263,18 +368,13 @@ export default function App() {
         <div className='toolbar'>
           <button
             className='primary'
-            disabled={isRecording}
-            onClick={startRecording}
+            onClick={isRecording ? pauseUnpauseRecording : startRecording}
           >
-            Start
+            {isPaused ? 'Unpause' : isRecording ? 'Pause' : 'Start'}
           </button>
-          <button
-            disabled={!isRecording}
-            onClick={stopRecording}
-          >
-            Stop
+          <button disabled={!isRecording} onClick={stopAndFinalizeRecording}>
+            Finalize
           </button>
-          <button onClick={finalize}>Finalize</button>
           <span className='pill'>sent: {chunksSent}</span>
           <span className='pill'>errors: {errors}</span>
           <span className='pill'>seq: {seq}</span>
@@ -282,26 +382,20 @@ export default function App() {
 
         <div className='grid'>
           <div>
-            <div
-              className='small'
-              style={{ margin: '12px 0 6px' }}
-            >
+            <div className='small' style={{ margin: '12px 0 6px' }}>
               Notes
             </div>
             <ul className='small'>
               <li>Requires HTTPS or localhost for mic access.</li>
               <li>
-                The overlap is an approximation using bytes ratio - fine for a
-                POC.
+                This solution uploads complete files with headers for each
+                chunk.
               </li>
               <li>The backend must expose POST /upload-chunk and /finalize.</li>
             </ul>
           </div>
           <div>
-            <div
-              className='small'
-              style={{ margin: '12px 0 6px' }}
-            >
+            <div className='small' style={{ margin: '12px 0 6px' }}>
               Status log
             </div>
             <div className='log'>

@@ -26,10 +26,10 @@ export default function App() {
   const [chunksSent, setChunksSent] = useState<number>(0);
   const [errors, setErrors] = useState<number>(0);
   const [log, setLog] = useState<LogItem[]>([]);
-  const [therapistId, setTherapistId] = useState<string>('');
-  const [patientId, setPatientId] = useState<string>('');
-  const [organizationId, setOrganizationId] = useState<string>('');
-  const [appointmentId, setAppointmentId] = useState<string>('');
+  const [therapistId, setTherapistId] = useState<string>('150');
+  const [patientId, setPatientId] = useState<string>('150');
+  const [organizationId, setOrganizationId] = useState<string>('150');
+  const [appointmentId, setAppointmentId] = useState<string>('150');
 
   // Refs to hold mutable data without causing re-renders
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);

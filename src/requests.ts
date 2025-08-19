@@ -4,6 +4,7 @@ export type FinalizePayload = {
   patientId?: string;
   organizationId?: string;
   appointmentId?: string;
+  methodType?: string;
 };
 
 type UploadChunkParams = {
@@ -46,7 +47,6 @@ export async function finalizeSession(payload: FinalizePayload) {
   if (!res.ok) {
     throw new Error(`Server responded with ${res.status}: ${await res.text()}`);
   }
-  // Some backends return empty body on success. Try JSON, fall back to text/null.
   const text = await res.text();
   if (!text.trim()) return null;
   try {

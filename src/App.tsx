@@ -5,7 +5,7 @@ import { finalizeSession, uploadChunk } from './requests';
 // Type definition for log items
 type LogItem = { ts: string; msg: string };
 type PersistedSession = {
-  active: boolean;
+  status: 'active' | 'ready';
   sessionId: string;
   seq: number;
   startMs: number;
@@ -41,8 +41,10 @@ export default function App() {
   const [sessionId, setSessionId] = useState<string>(() =>
     Math.random().toString(36).slice(2)
   );
+  const [methodType, setMethodType] = useState<string>('GENERAL');
   const [timesliceMs, setTimesliceMs] = useState<number>(100000);
   const [isPaused, setIsPaused] = useState(false);
+  const [isReady, setIsReady] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const [seq, setSeq] = useState(0);
   const [chunksSent, setChunksSent] = useState<number>(0);
@@ -69,7 +71,7 @@ export default function App() {
 
   function persistFromState(overrides: Partial<PersistedSession> = {}) {
     const data: PersistedSession = {
-      active: true,
+      status: 'active',
       sessionId,
       seq: seqRef(),
       startMs: startMsRef.current,
@@ -105,10 +107,10 @@ export default function App() {
       );
 
       mr.ondataavailable = async (evt: BlobEvent) => {
-        // Detach the handler to prevent any possibility of it being called again.
+        // handle this event only once for this recorder
         mr.ondataavailable = null;
 
-        if (!runningRef.current) return;
+        const shouldContinue = runningRef.current;
 
         const chunk = evt.data;
         if (chunk && chunk.size > 0) {
@@ -118,7 +120,6 @@ export default function App() {
           const nextSeq = currentSeq + 1;
 
           try {
-            console.log('chunk number:', currentSeq);
             await uploadChunk({
               chunk,
               sessionId,
@@ -138,28 +139,18 @@ export default function App() {
             pushLog('Upload error: ' + (e?.message || e));
           }
 
-          // Advance sequence and timeline for the *next* recorder
           startMsRef.current = endMs;
           setSeq(nextSeq);
         }
 
-        // Immediately start the next recorder to ensure seamless recording.
-        if (runningRef.current) {
+        if (shouldContinue) {
           startNewRecorder();
+        } else {
+          persistFromState({ status: 'ready' });
+          setIsReady(true);
         }
       };
 
-      // Stop the *previous* recorder, if one exists and is active.
-      // This is what triggers the ondataavailable for the previous chunk,
-      // which will then upload its data.
-      if (
-        mediaRecorderRef.current &&
-        mediaRecorderRef.current.state === 'recording'
-      ) {
-        mediaRecorderRef.current.stop();
-      }
-
-      // 4. Update the ref to point to our new recorder and start it.
       mediaRecorderRef.current = mr;
       mr.start(timesliceMs);
       pushLog(`Recorder for seq=${seqRef()} started.`);
@@ -176,7 +167,7 @@ export default function App() {
       const persisted = loadPersisted();
       const isResuming =
         !!persisted &&
-        persisted.active &&
+        persisted.status === 'active' &&
         persisted.sessionId === sessionId &&
         persisted.seq >= 0;
 
@@ -206,7 +197,7 @@ export default function App() {
         setErrors(0);
         pushLog('Recording started');
         persistFromState({
-          active: true,
+          status: 'active',
           seq: 0,
           startMs: startMsRef.current,
         });
@@ -249,7 +240,7 @@ export default function App() {
    * Stops the recording, ensures the final chunk is uploaded,
    * releases the microphone, and notifies the backend.
    */
-  async function stopAndFinalizeRecording() {
+  function stopRecording() {
     if (!mediaRecorderRef.current) {
       pushLog('No recording is active to stop.');
       return;
@@ -258,34 +249,38 @@ export default function App() {
     pushLog('Stopping and finalizing recording...');
     setIsRecording(false);
 
-    // Signal the loop to stop, then stop the current recorder to flush final dataavailable
+    // stop the loop first - we’ll still upload the final chunk
     runningRef.current = false;
 
+    // trigger the final ondataavailable
     if (mediaRecorderRef.current.state === 'recording') {
       mediaRecorderRef.current.stop();
     }
 
-    // Release mic
+    // release mic
     if (audioStreamRef.current) {
-      audioStreamRef.current.getTracks().forEach((track) => track.stop());
+      audioStreamRef.current.getTracks().forEach((t) => t.stop());
       audioStreamRef.current = null;
     }
-
+  }
+  async function finalize() {
     try {
+      pushLog('Finalize call completed.');
       await finalizeSession({
         sessionId,
         therapistId,
         patientId,
         organizationId,
         appointmentId,
+        methodType,
       });
       pushLog('Finalize call completed.');
-    } catch (e: any) {
-      pushLog('Finalize error: ' + (e?.message || e));
-    } finally {
+
       // Clear persistence
       clearPersisted();
       mediaRecorderRef.current = null;
+    } catch (err: any) {
+      pushLog('Finalize error: ' + (err?.message || err));
     }
   }
 
@@ -300,12 +295,13 @@ export default function App() {
 
   useEffect(() => {
     const p = loadPersisted();
-    if (p && p.active) {
+    if ((p && p.status === 'active') || p?.status === 'ready') {
       setSessionId(p.sessionId);
       setTherapistId(p.therapistId);
       setPatientId(p.patientId);
       setOrganizationId(p.organizationId);
       setAppointmentId(p.appointmentId);
+      setIsReady(p.status === 'ready');
       setTimesliceMs(p.timesliceMs || timesliceMs);
       startMsRef.current = p.startMs;
       setSeq(p.seq);
@@ -323,21 +319,6 @@ export default function App() {
     return () => window.removeEventListener('beforeunload', beforeUnload);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
-  // Keep storage in sync if user edits ids or timeslice mid-recording
-  useEffect(() => {
-    if (isRecording || loadPersisted()?.active) {
-      persistFromState();
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [
-    sessionId,
-    therapistId,
-    patientId,
-    organizationId,
-    appointmentId,
-    timesliceMs,
-  ]);
 
   return (
     <div className='wrap'>
@@ -383,7 +364,17 @@ export default function App() {
               onChange={(e) => setAppointmentId(e.target.value)}
             />
           </div>
-          <div></div>
+          <div>
+            <label>Method</label>
+            <select
+              value={methodType}
+              onChange={(e) => setMethodType(e.target.value)}
+            >
+              <option value='GENERAL'>GENERAL</option>
+              <option value='INTAKE'>INTAKE</option>
+              <option value='GENERAL_PSYCHIATRIC'>GENERAL PSY</option>
+            </select>
+          </div>
           <div></div>
         </div>
         <div className='row-3' style={{ marginTop: 12 }}>
@@ -400,14 +391,29 @@ export default function App() {
         </div>
 
         <div className='toolbar'>
+          {!isReady && (
+            <>
+              <button
+                className='primary'
+                onClick={isRecording ? pauseUnpauseRecording : startRecording}
+              >
+                {isPaused ? 'Unpause' : isRecording ? 'Pause' : 'Start'}
+              </button>
+              <button disabled={!isRecording} onClick={stopRecording}>
+                Stop
+              </button>
+            </>
+          )}
+          {isReady && methodType && (
+            <button onClick={finalize}>Finalize</button>
+          )}
           <button
-            className='primary'
-            onClick={isRecording ? pauseUnpauseRecording : startRecording}
+            onClick={() => {
+              clearPersisted();
+              setIsReady(false);
+            }}
           >
-            {isPaused ? 'Unpause' : isRecording ? 'Pause' : 'Start'}
-          </button>
-          <button disabled={!isRecording} onClick={stopAndFinalizeRecording}>
-            Finalize
+            clear persisted
           </button>
           <span className='pill'>sent: {chunksSent}</span>
           <span className='pill'>errors: {errors}</span>

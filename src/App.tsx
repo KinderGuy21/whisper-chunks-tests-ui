@@ -32,6 +32,7 @@ function clearPersisted() {
   try {
     localStorage.removeItem(STORAGE_KEY);
   } catch {}
+}
 
 /**
  * Main application component for the audio recorder.
@@ -66,6 +67,26 @@ export default function App() {
     setLog((l) => [{ ts: now(), msg }, ...l].slice(0, 500));
   }
 
+  function persistFromState(overrides: Partial<PersistedSession> = {}) {
+    const data: PersistedSession = {
+      active: true,
+      sessionId,
+      seq: seqRef(),
+      startMs: startMsRef.current,
+      timesliceMs,
+      therapistId,
+      patientId,
+      organizationId,
+      appointmentId,
+      updatedAt: Date.now(),
+      ...overrides,
+    };
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+    } catch {
+      // Ignore quota errors
+    }
+  }
   /**
    * Starts a new MediaRecorder instance and sets up its ondataavailable handler.
    * This function is the core of the recording loop.
@@ -94,12 +115,14 @@ export default function App() {
           const currentSeq = seqRef();
           const startMs = startMsRef.current;
           const endMs = startMs + timesliceMs;
+          const nextSeq = currentSeq + 1;
 
           try {
+            console.log('chunk number:', currentSeq);
             await uploadChunk({
               chunk,
               sessionId,
-              seq,
+              seq: currentSeq,
               startMs,
               endMs,
               therapistId,
@@ -108,6 +131,7 @@ export default function App() {
               organizationId,
             });
             setChunksSent((c) => c + 1);
+            persistFromState({ seq: nextSeq, startMs: endMs });
             pushLog(`Uploaded seq=${currentSeq} bytes=${chunk.size}`);
           } catch (e: any) {
             setErrors((x) => x + 1);
@@ -116,7 +140,7 @@ export default function App() {
 
           // Advance sequence and timeline for the *next* recorder
           startMsRef.current = endMs;
-          setSeq((s) => s + 1);
+          setSeq(nextSeq);
         }
 
         // Immediately start the next recorder to ensure seamless recording.
@@ -149,16 +173,44 @@ export default function App() {
    */
   async function startRecording() {
     try {
+      const persisted = loadPersisted();
+      const isResuming =
+        !!persisted &&
+        persisted.active &&
+        persisted.sessionId === sessionId &&
+        persisted.seq >= 0;
+
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       audioStreamRef.current = stream;
 
-      startMsRef.current = Date.now();
       runningRef.current = true;
-      setSeq(0);
-      setChunksSent(0);
-      setErrors(0);
       setIsRecording(true);
-      pushLog('Recording started');
+      setIsPaused(false);
+
+      if (isResuming) {
+        startMsRef.current = persisted!.startMs;
+        setSeq(persisted!.seq);
+        setTimesliceMs(persisted!.timesliceMs || timesliceMs);
+        setTherapistId(persisted!.therapistId);
+        setPatientId(persisted!.patientId);
+        setOrganizationId(persisted!.organizationId);
+        setAppointmentId(persisted!.appointmentId);
+        pushLog(
+          `Resuming session ${persisted!.sessionId} at seq=${persisted!.seq}`
+        );
+        persistFromState();
+      } else {
+        startMsRef.current = Date.now();
+        setSeq(0);
+        setChunksSent(0);
+        setErrors(0);
+        pushLog('Recording started');
+        persistFromState({
+          active: true,
+          seq: 0,
+          startMs: startMsRef.current,
+        });
+      }
 
       // Start the first recorder
       startNewRecorder();
@@ -206,32 +258,35 @@ export default function App() {
     pushLog('Stopping and finalizing recording...');
     setIsRecording(false);
 
-    // 1. Signal the recording loop to stop.
-    // The next ondataavailable handler will not start a new recorder.
+    // Signal the loop to stop, then stop the current recorder to flush final dataavailable
     runningRef.current = false;
 
-    // 2. Stop the current MediaRecorder. This will trigger one last
-    // `ondataavailable` event to process and upload the final audio chunk.
     if (mediaRecorderRef.current.state === 'recording') {
       mediaRecorderRef.current.stop();
     }
 
-    // 3. Release the microphone and clean up the stream reference.
+    // Release mic
     if (audioStreamRef.current) {
       audioStreamRef.current.getTracks().forEach((track) => track.stop());
       audioStreamRef.current = null;
     }
 
-    await finalizeSession({
-      sessionId,
-      therapistId,
-      patientId,
-      organizationId,
-      appointmentId,
-    });
-
-    // Optional: Reset refs after finalization
-    mediaRecorderRef.current = null;
+    try {
+      await finalizeSession({
+        sessionId,
+        therapistId,
+        patientId,
+        organizationId,
+        appointmentId,
+      });
+      pushLog('Finalize call completed.');
+    } catch (e: any) {
+      pushLog('Finalize error: ' + (e?.message || e));
+    } finally {
+      // Clear persistence
+      clearPersisted();
+      mediaRecorderRef.current = null;
+    }
   }
 
   // stable ref for seq inside ondataavailable
@@ -243,6 +298,42 @@ export default function App() {
     seqBox.current = seq;
   }, [seq]);
 
+  useEffect(() => {
+    const p = loadPersisted();
+    if (p && p.active) {
+      setSessionId(p.sessionId);
+      setTherapistId(p.therapistId);
+      setPatientId(p.patientId);
+      setOrganizationId(p.organizationId);
+      setAppointmentId(p.appointmentId);
+      setTimesliceMs(p.timesliceMs || timesliceMs);
+      startMsRef.current = p.startMs;
+      setSeq(p.seq);
+      pushLog(
+        `Recovered active session ${p.sessionId} (seq=${p.seq}). Click Start to continue.`
+      );
+    }
+    // When the page is being unloaded, keep the latest pointers if we were recording
+    const beforeUnload = () => {
+      if (runningRef.current) {
+        persistFromState();
+      }
+    };
+    window.addEventListener('beforeunload', beforeUnload);
+    return () => window.removeEventListener('beforeunload', beforeUnload);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Keep storage in sync if user edits ids or timeslice mid-recording
+  useEffect(() => {
+    if (isRecording || loadPersisted()?.active) {
+      persistFromState();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    sessionId,
+    therapistId,
+    patientId,
     organizationId,
     appointmentId,
     timesliceMs,

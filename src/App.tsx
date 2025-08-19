@@ -1,25 +1,18 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { getSupportedMimeTypes, now } from './utils';
+import { finalizeSession, uploadChunk } from './requests';
 
 // Type definition for log items
 type LogItem = { ts: string; msg: string };
 
 /**
- * Returns the current time formatted as a string.
- */
-function now() {
-  return new Date().toLocaleTimeString();
-}
-
-/**
  * Main application component for the audio recorder.
  */
 export default function App() {
-  const [backend, setBackend] = useState<string>('http://localhost:3000');
   const [sessionId, setSessionId] = useState<string>(() =>
     Math.random().toString(36).slice(2)
   );
   const [timesliceMs, setTimesliceMs] = useState<number>(100000);
-  const [mimeType, setMimeType] = useState<string>('audio/webm;codecs=opus');
   const [isPaused, setIsPaused] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const [seq, setSeq] = useState(0);
@@ -46,18 +39,6 @@ export default function App() {
   }
 
   /**
-   * Checks if a given mime type is supported by the browser.
-   * @param mt The mime type string.
-   * @returns A boolean indicating support.
-   */
-  function supportsMimeType(mt: string) {
-    return (
-      typeof MediaRecorder !== 'undefined' &&
-      (MediaRecorder.isTypeSupported?.(mt) ?? true)
-    );
-  }
-
-  /**
    * Starts a new MediaRecorder instance and sets up its ondataavailable handler.
    * This function is the core of the recording loop.
    */
@@ -68,15 +49,12 @@ export default function App() {
     }
 
     try {
-      const mt = supportsMimeType(mimeType) ? mimeType : undefined;
-      // 1. Create the new recorder instance
+      const mimeType = getSupportedMimeTypes()[0];
       const mr = new MediaRecorder(
         audioStreamRef.current,
-        mt ? ({ mimeType: mt } as MediaRecorderOptions) : undefined
+        mimeType ? { mimeType } : undefined
       );
 
-      // 2. The ondataavailable handler will process the current chunk
-      //    and then recursively call startNewRecorder to continue the chain.
       mr.ondataavailable = async (evt: BlobEvent) => {
         // Detach the handler to prevent any possibility of it being called again.
         mr.ondataavailable = null;
@@ -90,7 +68,17 @@ export default function App() {
           const endMs = startMs + timesliceMs;
 
           try {
-            await uploadBlob(chunk, currentSeq, startMs, endMs);
+            await uploadChunk({
+              chunk,
+              sessionId,
+              seq,
+              startMs,
+              endMs,
+              therapistId,
+              patientId,
+              appointmentId,
+              organizationId,
+            });
             setChunksSent((c) => c + 1);
             pushLog(`Uploaded seq=${currentSeq} bytes=${chunk.size}`);
           } catch (e: any) {
@@ -103,8 +91,7 @@ export default function App() {
           setSeq((s) => s + 1);
         }
 
-        // 3. Immediately start the next recorder to ensure seamless recording.
-        //    This call creates the next link in the chain.
+        // Immediately start the next recorder to ensure seamless recording.
         if (runningRef.current) {
           startNewRecorder();
         }
@@ -128,16 +115,15 @@ export default function App() {
       pushLog('Recorder creation error: ' + (err?.message || err));
     }
   }
+
   /**
    * Starts the initial audio recording process.
    */
   async function startRecording() {
     try {
-      // Get the audio stream and store it in a ref. This stream will be reused.
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       audioStreamRef.current = stream;
 
-      // Reset state and refs
       startMsRef.current = Date.now();
       runningRef.current = true;
       setSeq(0);
@@ -155,8 +141,6 @@ export default function App() {
 
   /**
    * Toggles the pause/unpause state of the recording process.
-   * Assumes mediaRecorderRef.current and audioStreamRef.current are already set up
-   * and the recording has been started.
    */
   async function pauseUnpauseRecording() {
     if (!mediaRecorderRef.current) {
@@ -171,49 +155,16 @@ export default function App() {
       setIsPaused(true);
       // Do NOT stop audio tracks here, as that would end the stream.
     } else if (mediaRecorderRef.current.state === 'paused') {
-      // If currently paused, resume it
       mediaRecorderRef.current.resume();
       setIsPaused(false);
       pushLog('Recording resumed');
     } else {
-      // Handle other states like 'inactive' or 'stopped' if necessary,
-      // though typically this function would only be called when recording is active.
       console.warn(
         `MediaRecorder is in an unexpected state: ${mediaRecorderRef.current.state}`
       );
     }
   }
 
-  /**
-   * Finalizes the session on the backend.
-   */
-  async function finalize() {
-    pushLog('Calling finalize endpoint...');
-    try {
-      const res = await fetch(`${backend}/finalize`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          sessionId,
-          therapistId,
-          patientId,
-          organizationId,
-          appointmentId,
-        }),
-      });
-      if (!res.ok)
-        throw new Error(
-          `Server responded with ${res.status}: ${await res.text()}`
-        );
-
-      const j = await res.json();
-      pushLog('Finalize successful: ' + JSON.stringify(j));
-    } catch (e: any) {
-      pushLog('Finalize error: ' + (e?.message || e));
-    }
-  }
   /**
    * Stops the recording, ensures the final chunk is uploaded,
    * releases the microphone, and notifies the backend.
@@ -243,42 +194,16 @@ export default function App() {
       audioStreamRef.current = null;
     }
 
-    // 4. Call the backend to finalize the session.
-    await finalize();
+    await finalizeSession({
+      sessionId,
+      therapistId,
+      patientId,
+      organizationId,
+      appointmentId,
+    });
 
     // Optional: Reset refs after finalization
     mediaRecorderRef.current = null;
-  }
-
-  /**
-   * Uploads a single chunk of audio data to the backend.
-   * @param blob The Blob object to upload.
-   * @param seq The sequence number of the chunk.
-   * @param startMs The start timestamp of the chunk.
-   * @param endMs The end timestamp of the chunk.
-   */
-  async function uploadBlob(
-    blob: Blob,
-    seq: number,
-    startMs: number,
-    endMs: number
-  ) {
-    const fd = new FormData();
-    fd.append('file', blob, `chunk-${seq}.webm`);
-    fd.append('mimeType', blob.type);
-    fd.append('sessionId', sessionId);
-    fd.append('seq', String(seq));
-    fd.append('startMs', String(startMs));
-    fd.append('endMs', String(endMs));
-    if (therapistId) fd.append('therapistId', therapistId);
-    if (patientId) fd.append('patientId', patientId);
-    if (organizationId) fd.append('organizationId', organizationId);
-    if (appointmentId) fd.append('appointmentId', appointmentId);
-    const res = await fetch(`${backend}/upload-chunk`, {
-      method: 'POST',
-      body: fd,
-    });
-    if (!res.ok) throw new Error(await res.text());
   }
 
   // stable ref for seq inside ondataavailable
@@ -295,14 +220,6 @@ export default function App() {
       <div className='card'>
         <h1>Audio Chunker POC</h1>
         <div className='row'>
-          <div>
-            <label>Backend base URL</label>
-            <input
-              value={backend}
-              onChange={(e) => setBackend(e.target.value)}
-              placeholder='http://localhost:3000'
-            />
-          </div>
           <div>
             <label>Session ID</label>
             <input
@@ -354,13 +271,6 @@ export default function App() {
               min={1000}
               step={500}
               onChange={(e) => setTimesliceMs(Number(e.target.value))}
-            />
-          </div>
-          <div>
-            <label>Mime type (optional)</label>
-            <input
-              value={mimeType}
-              onChange={(e) => setMimeType(e.target.value)}
             />
           </div>
         </div>

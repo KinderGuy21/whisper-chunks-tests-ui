@@ -55,6 +55,13 @@ export default function App() {
   const [organizationId, setOrganizationId] = useState<string>('150');
   const [appointmentId, setAppointmentId] = useState<string>('150');
 
+  // Mode: mic vs file
+  const [mode, setMode] = useState<'mic' | 'file'>('mic');
+  const [playbackRate, setPlaybackRate] = useState<number>(1);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const audioElRef = useRef<HTMLAudioElement | null>(null);
+  const fileUrlRef = useRef<string | null>(null);
+
   // Refs to hold mutable data without causing re-renders
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioStreamRef = useRef<MediaStream | null>(null);
@@ -163,6 +170,10 @@ export default function App() {
    * Starts the initial audio recording process.
    */
   async function startRecording() {
+    if (mode === 'file') {
+      await startFileProcessing();
+      return;
+    }
     try {
       const persisted = loadPersisted();
       const isResuming =
@@ -207,6 +218,71 @@ export default function App() {
       startNewRecorder();
     } catch (err: any) {
       pushLog('Mic error: ' + (err?.message || err));
+    }
+  }
+
+  async function startFileProcessing() {
+    try {
+      const file = fileInputRef.current?.files?.[0];
+      if (!file) {
+        pushLog('Please choose an audio file first.');
+        return;
+      }
+
+      // Prepare audio element to play file, capture stream
+      if (fileUrlRef.current) {
+        URL.revokeObjectURL(fileUrlRef.current);
+        fileUrlRef.current = null;
+      }
+      const url = URL.createObjectURL(file);
+      fileUrlRef.current = url;
+
+      let audioEl = audioElRef.current;
+      if (!audioEl) {
+        audioEl = document.createElement('audio');
+        audioElRef.current = audioEl;
+      }
+      audioEl.src = url;
+      audioEl.crossOrigin = 'anonymous';
+      audioEl.preload = 'auto';
+      audioEl.playbackRate = playbackRate || 1;
+      audioEl.muted = true; // avoid feedback
+
+      // Some browsers require metadata before captureStream becomes available
+      await new Promise<void>((resolve) => {
+        const onMeta = () => {
+          audioEl!.removeEventListener('loadedmetadata', onMeta);
+          resolve();
+        };
+        audioEl!.addEventListener('loadedmetadata', onMeta);
+      });
+
+      const stream =
+        (audioEl as any).captureStream?.() ||
+        (audioEl as any).mozCaptureStream?.();
+      if (!stream) {
+        pushLog('captureStream is not supported in this browser.');
+        return;
+      }
+      audioStreamRef.current = stream as MediaStream;
+
+      runningRef.current = true;
+      setIsRecording(true);
+      setIsPaused(false);
+
+      // For file playback, we start at t=0 and advance by timesliceMs
+      startMsRef.current = 0;
+      setSeq(0);
+      setChunksSent(0);
+      setErrors(0);
+      pushLog('File chunking started');
+      persistFromState({ status: 'active', seq: 0, startMs: 0 });
+
+      // Start stream playback and recording loop
+      await audioEl.play();
+      startNewRecorder();
+    } catch (err: any) {
+      pushLog('File processing error: ' + (err?.message || err));
     }
   }
 
@@ -257,10 +333,20 @@ export default function App() {
       mediaRecorderRef.current.stop();
     }
 
-    // release mic
+    // release mic or file stream
     if (audioStreamRef.current) {
       audioStreamRef.current.getTracks().forEach((t) => t.stop());
       audioStreamRef.current = null;
+    }
+    // Stop file playback and cleanup URL
+    if (audioElRef.current) {
+      try {
+        audioElRef.current.pause();
+      } catch {}
+    }
+    if (fileUrlRef.current) {
+      URL.revokeObjectURL(fileUrlRef.current);
+      fileUrlRef.current = null;
     }
   }
   async function finalize() {
@@ -333,7 +419,58 @@ export default function App() {
             />
           </div>
         </div>
-        <div className='row-3' style={{ marginTop: 12 }}>
+        <div
+          className='row-3'
+          style={{ marginTop: 12 }}
+        >
+          <div>
+            <label>Mode</label>
+            <div>
+              <label style={{ marginRight: 8 }}>
+                <input
+                  type='radio'
+                  checked={mode === 'mic'}
+                  onChange={() => setMode('mic')}
+                />
+                Mic
+              </label>
+              <label>
+                <input
+                  type='radio'
+                  checked={mode === 'file'}
+                  onChange={() => setMode('file')}
+                />
+                File
+              </label>
+            </div>
+          </div>
+          {mode === 'file' && (
+            <div>
+              <label>Audio File</label>
+              <input
+                type='file'
+                accept='audio/*'
+                ref={fileInputRef}
+              />
+            </div>
+          )}
+          {mode === 'file' && (
+            <div>
+              <label>Playback Rate</label>
+              <input
+                type='number'
+                min={0.1}
+                step={0.1}
+                value={playbackRate}
+                onChange={(e) => setPlaybackRate(Number(e.target.value))}
+              />
+            </div>
+          )}
+        </div>
+        <div
+          className='row-3'
+          style={{ marginTop: 12 }}
+        >
           <div>
             <label>Therapist ID</label>
             <input
@@ -356,7 +493,10 @@ export default function App() {
             />
           </div>
         </div>
-        <div className='row-3' style={{ marginTop: 12 }}>
+        <div
+          className='row-3'
+          style={{ marginTop: 12 }}
+        >
           <div>
             <label>Appointment ID</label>
             <input
@@ -377,7 +517,10 @@ export default function App() {
           </div>
           <div></div>
         </div>
-        <div className='row-3' style={{ marginTop: 12 }}>
+        <div
+          className='row-3'
+          style={{ marginTop: 12 }}
+        >
           <div>
             <label>Timeslice (ms)</label>
             <input
@@ -399,7 +542,10 @@ export default function App() {
               >
                 {isPaused ? 'Unpause' : isRecording ? 'Pause' : 'Start'}
               </button>
-              <button disabled={!isRecording} onClick={stopRecording}>
+              <button
+                disabled={!isRecording}
+                onClick={stopRecording}
+              >
                 Stop
               </button>
             </>
@@ -422,7 +568,10 @@ export default function App() {
 
         <div className='grid'>
           <div>
-            <div className='small' style={{ margin: '12px 0 6px' }}>
+            <div
+              className='small'
+              style={{ margin: '12px 0 6px' }}
+            >
               Notes
             </div>
             <ul className='small'>
@@ -432,10 +581,18 @@ export default function App() {
                 chunk.
               </li>
               <li>The backend must expose POST /upload-chunk and /finalize.</li>
+              <li>
+                File mode uses HTMLMediaElement.captureStream to produce valid
+                chunk containers during playback. Increase Playback Rate to
+                speed up processing.
+              </li>
             </ul>
           </div>
           <div>
-            <div className='small' style={{ margin: '12px 0 6px' }}>
+            <div
+              className='small'
+              style={{ margin: '12px 0 6px' }}
+            >
               Status log
             </div>
             <div className='log'>
